@@ -1,0 +1,1 @@
+Let x = (1, 2) and y = (3, 1) be two vectors. Compute the Gram matrix G with entries G11 = x.x, G12 = x.y, G22 = y.y, then compute det(G). Show that sqrt(det(G)) equals the area of the parallelogram spanned by x and y, and explain why the area is zero when y is a multiple of x.

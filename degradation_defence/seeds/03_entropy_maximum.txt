@@ -1,0 +1,1 @@
+For a probability vector a = (a1, ..., an) define the entropy H(a) = -sum ai log ai. Compute H for a = (1, 0, ..., 0) and for the uniform vector a = (1/n, ..., 1/n). Explain why the uniform vector gives the largest possible entropy and the first one gives the smallest.

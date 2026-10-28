@@ -1,0 +1,1 @@
+Let u = (1, 0) and v = (0, 1) be two points in the plane. For a number t between 0 and 1, consider the point w = t*u + (1 - t)*v. Show that w always lies on the segment joining u and v, and find the value of t for which w is the midpoint of the segment.
