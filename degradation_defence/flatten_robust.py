@@ -1,5 +1,28 @@
 #!/usr/bin/env python3
+"""Gradient-guided search for a flattening sequence S (push softmax toward the barycenter).
 
+Objective (maximize), over 8 training prompts C_j:
+
+    F_j(S) = N_eff( softmax( z(C_j + S) ) ) = 1 / sum_i p_{j,i}^2        (last position)
+    F(S)   = (1/8) * sum_j F_j(S)
+
+Search (gradient shortlist + exact verification):
+  1. initialize a sequence of SEQ_LEN tokens;
+  2. compute, per training prompt, the gradient g_{j,r} = d F_j / d e_r at every suffix
+     position r (one backward per prompt gives all positions);
+  3. for each position r, score every vocabulary token v by the predicted first-order
+     gain of swapping s_r -> v,  g_{j,r} . (E_v - E_{s_r}), combined over prompts by the
+     MEAN (average predicted gain) or the WORST case (min over prompts, for robustness);
+  4. verify the top candidates with real forward passes (exact F);
+  5. accept a substitution only if F(S) increases;
+  6. repeat sweeps until no position improves (plateau).
+
+The gradient shortlist avoids exploring the whole vocabulary at each position. A plateau
+signals saturation of the search, not necessarily the geometric maximum.
+
+Style note: plain, explicit control flow (classic for-loops, explicit accumulators,
+no comprehensions or lambdas), Java-like. Only the tensor ops are vectorized.
+"""
 import json
 import random
 import time
@@ -15,196 +38,201 @@ MODEL = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
 tok = AutoTokenizer.from_pretrained(MODEL)
 model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.float32, attn_implementation="sdpa").eval()
 
+# Freeze the model; gradients are taken only with respect to the input embeddings.
+for parameter in model.parameters():
+    parameter.requires_grad_(False)
+EMB = model.get_input_embeddings().weight          # |V| x d
+
 
 def encode(text):
     return tok.encode(text, add_special_tokens=False)
 
 
-# Build the candidate vocabulary: every id that is not a special token.
+# Candidate vocabulary: every id that is not a special token.
 specials = set(tok.all_special_ids)
 vocab_limit = min(len(tok), model.config.vocab_size)
 VOCAB = []
 for token_id in range(vocab_limit):
     if token_id not in specials:
         VOCAB.append(token_id)
+VOCAB_TENSOR = torch.tensor(VOCAB)
+EMB_VOCAB = EMB[VOCAB_TENSOR].detach()             # |V'| x d, candidate embeddings
 
-PAIRS = [
-    ("The capital of France is", " Paris, a city on the river Seine in the north."),
-    ("Water is made of hydrogen and", " oxygen, two atoms of the first and one of the second."),
-    ("The opposite of hot is", " cold, and the opposite of up is down."),
-    ("Two plus two equals", " four, and three plus three equals six."),
-    ("The sun rises in the", " east and sets in the west every single day."),
-    ("A triangle has three", " sides and three angles that sum to one hundred eighty."),
-    ("Ice is the solid form of", " water, formed when the temperature drops below zero."),
-    ("The square root of nine is", " three, because three times three equals nine."),
-    ("The Earth orbits around the", " sun once every year, which defines a calendar year."),
-    ("The chemical symbol for gold is", " Au, from the Latin word aurum for the metal."),
-    ("The largest planet in our solar system is", " Jupiter, a gas giant with many moons."),
-    ("The freezing point of water is zero degrees", " Celsius, which is thirty two in Fahrenheit."),
-    ("A hexagon is a shape with six", " sides and six angles, like a honeycomb cell."),
-    ("The Pacific is the largest", " ocean on Earth, covering a third of the surface."),
-    ("A decade is a period of ten", " years, and a century is one hundred years."),
-    ("The human heart has four", " chambers that pump blood around the whole body."),
+TRAIN_PROMPTS = [
+    "The capital of France is",
+    "Water is made of hydrogen and",
+    "The opposite of hot is",
+    "Two plus two equals",
+    "The sun rises in the",
+    "A triangle has three",
+    "Ice is the solid form of",
+    "The square root of nine is",
+]
+TEST_PROMPTS = [
+    "The Earth orbits around the",
+    "The chemical symbol for gold is",
+    "The largest planet in our solar system is",
+    "The freezing point of water is zero degrees",
+    "A hexagon is a shape with six",
+    "The Pacific is the largest",
+    "A decade is a period of ten",
+    "The human heart has four",
 ]
 
-M = 10            # reference tokens kept per prompt
-K = 6             # suffix length built by greedy growth
-POOL = 36         # candidate tokens per step
-BEAM = 3          # beams kept during growth
-SWEEPS = 2        # coordinate-ascent refinement sweeps
+SEQ_LEN = 24          # sequence length to search (the specification uses 24)
+TOPK = 32             # candidates verified with real forwards, per position
+MAX_SWEEPS = 3        # coordinate sweeps over the sequence
+CRITERION = "worst"   # "mean" = average predicted gain, "worst" = min over prompts
 
-# DATA[i] = (context_ids, reference_ids) for prompt i.
-DATA = []
-for stem, continuation in PAIRS:
-    context_ids = encode(stem)
-    reference_ids = encode(continuation)[:M]
-    DATA.append((context_ids, reference_ids))
-
-TRAIN = DATA[:8]
-TEST = DATA[8:]
+TRAIN = []
+for prompt in TRAIN_PROMPTS:
+    TRAIN.append(encode(prompt))
+TEST = []
+for prompt in TEST_PROMPTS:
+    TEST.append(encode(prompt))
 
 
 @torch.inference_mode()
-def measure(context_ids, suffix_ids, reference_ids):
-    """Return (N_eff, margin, NLL) at the reference positions of context+suffix+reference."""
-    full_ids = context_ids + suffix_ids + reference_ids
-    out = model(input_ids=torch.tensor([full_ids]), use_cache=False)
-    start = len(context_ids) + len(suffix_ids)
-    n_ref = len(reference_ids)
-    rows = out.logits[0, start - 1:start - 1 + n_ref].double()
-
-    probs = torch.softmax(rows, 1)
-    collision = (probs * probs).sum(1)
-    n_eff = float((1.0 / collision).mean())
-
-    index = torch.arange(n_ref)
-    targets = torch.tensor(reference_ids)
-    masked = rows.clone()
-    true_logit = masked[index, targets].clone()
-    masked[index, targets] = -float("inf")
-    margin = float((true_logit - masked.max(1).values).mean())
-
-    nll = float(-torch.log_softmax(rows, 1)[index, targets].mean())
-    return n_eff, margin, nll
+def neff_many(context_ids, suffix_list):
+    """N_eff of the final-position distribution for each suffix (all equal length), batched."""
+    batch = []
+    for suffix in suffix_list:
+        batch.append(context_ids + suffix)
+    out = model(input_ids=torch.tensor(batch), use_cache=False)
+    last = out.logits[:, -1].double()
+    probs = torch.softmax(last, -1)
+    collision = (probs * probs).sum(-1)
+    values = (1.0 / collision)
+    result = []
+    for i in range(len(suffix_list)):
+        result.append(float(values[i]))
+    return result
 
 
-def objective(suffix_ids, dataset):
-    """F(S) = mean N_eff over the dataset's contexts."""
-    total = 0.0
-    for context_ids, reference_ids in dataset:
-        n_eff, _, _ = measure(context_ids, suffix_ids, reference_ids)
-        total += n_eff
-    return total / len(dataset)
+def objective_many(suffix_list, contexts):
+    """F = mean over the given contexts of N_eff, for each suffix. Returns a list."""
+    totals = [0.0] * len(suffix_list)
+    for context_ids in contexts:
+        per_suffix = neff_many(context_ids, suffix_list)
+        for i in range(len(suffix_list)):
+            totals[i] += per_suffix[i]
+    means = []
+    for i in range(len(suffix_list)):
+        means.append(totals[i] / len(contexts))
+    return means
 
 
-# Baseline (empty suffix) for every prompt, indexed by position in DATA.
-baseline = []
-for context_ids, reference_ids in DATA:
-    baseline.append(measure(context_ids, [], reference_ids))
+def objective(suffix, contexts):
+    return objective_many([suffix], contexts)[0]
 
+
+def gradients_per_prompt(suffix):
+    """For each training prompt, one backward gives d N_eff / d e_r at every suffix
+    position. Returns a list (one entry per prompt) of tensors shaped [SEQ_LEN, d]."""
+    per_prompt = []
+    for context_ids in TRAIN:
+        full_ids = context_ids + suffix
+        embedded = EMB[torch.tensor([full_ids])].detach().clone()
+        embedded.requires_grad_(True)
+        out = model(inputs_embeds=embedded, use_cache=False)
+        last = out.logits[0, -1].float()
+        probs = torch.softmax(last, 0)
+        n_eff = 1.0 / (probs * probs).sum()
+        n_eff.backward()
+        suffix_start = len(context_ids)
+        grad_rows = embedded.grad[0, suffix_start:suffix_start + len(suffix)].detach()
+        per_prompt.append(grad_rows)
+    return per_prompt
+
+
+def shortlist(suffix, position, grads, k):
+    """Top-k vocabulary ids by predicted first-order gain of swapping suffix[position]."""
+    base_vec = EMB[suffix[position]].detach()           # d
+    combined = None
+    for grad_rows in grads:
+        direction = grad_rows[position].detach()        # d
+        # predicted gain for every candidate v: (E_v - E_base) . direction
+        gain = torch.matmul(EMB_VOCAB, direction) - torch.dot(base_vec, direction)
+        if combined is None:
+            if CRITERION == "worst":
+                combined = gain.clone()
+            else:
+                combined = gain.clone()
+        else:
+            if CRITERION == "worst":
+                combined = torch.minimum(combined, gain)
+            else:
+                combined = combined + gain
+    if CRITERION != "worst":
+        combined = combined / len(grads)
+    top = torch.topk(combined, k).indices
+    ids = []
+    for i in range(top.shape[0]):
+        ids.append(VOCAB[int(top[i])])
+    return ids
+
+
+# 1. Initialize a random sequence of SEQ_LEN tokens.
+suffix = rng.sample(VOCAB, SEQ_LEN)
+best_f = objective(suffix, TRAIN)
 start_time = time.time()
-pool = rng.sample(VOCAB, POOL)
+progression = [best_f]
+print("init: F=%.2f  (%.0fs)" % (best_f, time.time() - start_time), flush=True)
 
-# Phase 1: greedy beam growth up to length K.
-beams = [[]]
-for step in range(K):
-    # Expand every beam by every pool token.
-    candidates = []
-    for beam in beams:
-        for token_id in pool:
-            candidates.append(beam + [token_id])
-    # Score each candidate.
-    scores = []
-    for candidate in candidates:
-        scores.append(objective(candidate, TRAIN))
-    # Keep the best BEAM by repeated maximum selection (no sort, no lambda).
-    beams = []
-    used = [False] * len(candidates)
-    for _ in range(min(BEAM, len(candidates))):
-        best_index = -1
-        best_value = None
-        for i in range(len(candidates)):
-            if used[i]:
-                continue
-            if best_value is None or scores[i] > best_value:
-                best_value = scores[i]
-                best_index = i
-        used[best_index] = True
-        beams.append(candidates[best_index])
-    best_suffix = beams[0]
-    print("grow %d: F=mean N_eff(train)=%.2f  S=%r  (%.0fs)" % (
-        step + 1, objective(best_suffix, TRAIN), tok.decode(best_suffix), time.time() - start_time), flush=True)
-
-# Phase 2: coordinate-ascent refinement (revisit each position; keep a change only if F rises).
-best_suffix = beams[0]
-best_f = objective(best_suffix, TRAIN)
-for sweep in range(SWEEPS):
+# 5-6. Coordinate sweeps: gradient shortlist, exact verification, accept gains, until plateau.
+for sweep in range(MAX_SWEEPS):
     improved = False
-    for position in range(len(best_suffix)):
-        best_token = None
-        best_token_f = best_f
-        for token_id in pool:
-            candidate = best_suffix[:position] + [token_id] + best_suffix[position + 1:]
-            candidate_f = objective(candidate, TRAIN)
-            if candidate_f > best_token_f + 1e-9:
-                best_token_f = candidate_f
-                best_token = token_id
-        if best_token is not None:
-            best_suffix = best_suffix[:position] + [best_token] + best_suffix[position + 1:]
-            best_f = best_token_f
+    grads = gradients_per_prompt(suffix)          # 2. gradients on the 8 prompts
+    for position in range(SEQ_LEN):
+        candidate_ids = shortlist(suffix, position, grads, TOPK)   # 3. candidates
+        trial_suffixes = []
+        for token_id in candidate_ids:
+            trial = suffix[:position] + [token_id] + suffix[position + 1:]
+            trial_suffixes.append(trial)
+        trial_f = objective_many(trial_suffixes, TRAIN)            # 4. exact forwards
+        best_index = -1
+        best_value = best_f
+        for i in range(len(trial_f)):
+            if trial_f[i] > best_value + 1e-9:
+                best_value = trial_f[i]
+                best_index = i
+        if best_index >= 0:                                        # 5. accept if F rises
+            suffix = trial_suffixes[best_index]
+            best_f = best_value
             improved = True
-    print("refine %d: F=%.2f  S=%r  (%.0fs)" % (
-        sweep + 1, best_f, tok.decode(best_suffix), time.time() - start_time), flush=True)
-    if not improved:
+    progression.append(best_f)
+    print("sweep %d: F=%.2f  S=%r  (%.0fs)" % (
+        sweep + 1, best_f, tok.decode(suffix), time.time() - start_time), flush=True)
+    if not improved:                                               # 6. plateau -> stop
+        print("plateau reached (no position improved)", flush=True)
         break
 
-# Conditions to report: random control, single-prompt barycenter suffix, and the robust S*.
-conditions = []
-conditions.append(("random", rng.sample(VOCAB, K)))
-conditions.append(("prev barycenter", encode("奠ឌ奠")))
-conditions.append(("robust S*", best_suffix))
-
+# Report: does the sequence raise N_eff on held-out TEST prompts too?
 print("")
-print("%-16s %-5s | %13s %10s %7s %11s" % (
-    "condition", "split", "median dN_eff", "min dN_eff", "frac up", "median dNLL"))
+print("final F (train) = %.2f" % best_f)
+print("F progression  = %s" % ", ".join("%.1f" % value for value in progression))
 
-# Split boundaries by index: TRAIN = DATA[0:8], TEST = DATA[8:].
-splits = [("train", 0, 8), ("test", 8, len(DATA))]
-out = {"S_star": best_suffix, "text": tok.decode(best_suffix), "conditions": {}}
-for name, suffix_ids in conditions:
-    out["conditions"][name] = {}
-    for split_name, lo, hi in splits:
-        delta_neff = []
-        delta_nll = []
-        for i in range(lo, hi):
-            context_ids, reference_ids = DATA[i]
-            base_neff, _, base_nll = baseline[i]
-            n_eff, _, nll = measure(context_ids, suffix_ids, reference_ids)
-            delta_neff.append(n_eff - base_neff)
-            delta_nll.append(nll - base_nll)
+base_train = objective([], TRAIN)
+base_test = objective([], TEST)
+flat_train = objective(suffix, TRAIN)
+flat_test = objective(suffix, TEST)
+print("")
+print("%-6s | %12s %12s" % ("split", "baseline N_eff", "with S N_eff"))
+print("%-6s | %12.2f %12.2f" % ("train", base_train, flat_train))
+print("%-6s | %12.2f %12.2f" % ("test", base_test, flat_test))
 
-        delta_neff.sort()
-        count = len(delta_neff)
-        median_neff = delta_neff[count // 2]
-        min_neff = delta_neff[0]
-        rising = 0
-        for value in delta_neff:
-            if value > 0:
-                rising += 1
-        frac_up = rising / count
-        sorted_nll = sorted(delta_nll)
-        median_nll = sorted_nll[count // 2]
-
-        out["conditions"][name][split_name] = {
-            "median_dNeff": median_neff, "min_dNeff": min_neff,
-            "frac_up": frac_up, "median_dNLL": median_nll,
-        }
-        print("%-16s %-5s | %13.2f %10.2f %7.2f %11.3f" % (
-            name, split_name, median_neff, min_neff, frac_up, median_nll))
-
+out = {
+    "S_star": suffix,
+    "text": tok.decode(suffix),
+    "criterion": CRITERION,
+    "seq_len": SEQ_LEN,
+    "F_train": best_f,
+    "F_progression": progression,
+    "baseline_train": base_train, "baseline_test": base_test,
+    "flat_train": flat_train, "flat_test": flat_test,
+}
 out_file = open("runs/flatten_robust.json", "w")
 json.dump(out, out_file, indent=2, ensure_ascii=False)
 out_file.close()
 print("")
-print("robust = raises N_eff on unseen TEST contexts (median high, min>0, frac up=1).")
-print("saved (%.0fs)" % (time.time() - start_time))
+print("saved runs/flatten_robust.json  (%.0fs)" % (time.time() - start_time))

@@ -31,15 +31,17 @@ happen on purpose, and found a two-stage method:
    contentless function word such as ` of`, ` the`, ` and` or `\n`, induces a
    loop on that token.
 
-The two-stage approach is **robust to temperature**: the loop still holds
-under sampling (T = 0.7 and T = 1.0), where repetition alone often breaks.
+The two-stage approach is **robust to temperature**: under sampling, where
+repetition alone often breaks, flattening first keeps the loop at lock ≈ 1.00
+at T = 0.7 and raises it in every case at T = 1.0.
 Both stages are measured numerically (effective number of tokens, lock rate),
 with no human judgement of the output.
 
 ## The two tools
 
-Two small, self-contained research tools that both play with the idea of
-**hiding structure inside text that looks like noise**:
+Two small, self-contained research tools. The first shows that structure
+can hide inside word slop; the second uses what the model does with such
+input to steer its output:
 
 | Tool | Folder | What it does | Language / deps |
 |---|---|---|---|
@@ -47,8 +49,10 @@ Two small, self-contained research tools that both play with the idea of
 | **Logit flattening + convergence** | [`degradation_defence`](degradation_defence/) | Searches for a short token sequence that pushes an LLM's next-token distribution toward uniform ("flattening"), then shows that a repeated token after it locks generation onto that token ("convergence"). | Python, PyTorch, Hugging Face `transformers` |
 
 Each folder has its own detailed README with the full math and results:
-[`fog/README.md`](fog/README.md) and
-[`degradation_defence`](degradation_defence/README.md). This file is the
+[`fog/README.md`](fog/README.md) (printable version with rendered formulas:
+[`fog/README.pdf`](fog/README.pdf)) and
+[`degradation_defence/README.md`](degradation_defence/README.md) (printable:
+[`degradation_defence/README.pdf`](degradation_defence/README.pdf)). This file is the
 overview: what each algorithm does, how it works, how to run it, and its limits.
 
 ---
@@ -172,113 +176,67 @@ salt, permutation, and pairing exactly and exports `decodeWall`, `extractBits`,
 
 ## 2. Logit-simplex flattening and induced single-token convergence
 
-Folder: [`degradation_defence`](degradation_defence/). Model under study:
-`deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B`, on CPU, float32 (float64 for the
-small spectral quantities).
+Folder: [`degradation_defence`](degradation_defence/) · full write-up:
+[`degradation_defence/README.md`](degradation_defence/README.md)
+([PDF](degradation_defence/README.pdf)). Model under
+study: `deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B`, on CPU, float32.
 
 Two algorithms run in sequence on a context `C`:
 
-1. **Flattening** — find a short suffix `S_flat` that pushes the next-token
+1. **Flattening** — find a token sequence `S_flat` that pushes the next-token
    distribution as close as possible to the uniform distribution (the
    barycenter of the vocabulary simplex), washing out the context.
-2. **Convergence** — append one token `U` repeated `R` times and measure how
-   strongly generation then locks onto `U`.
+2. **Convergence** — append one contentless token `U` repeated `R` times and
+   measure how strongly generation then locks onto `U`.
 
 ### Measures
 
-- **Effective number of tokens:** `N_eff = 1 / Σ pᵢ²` where `p = softmax(logits)`.
-  It equals `exp` of the Rényi-2 entropy: `1` means one token takes all the
-  mass, `|V|` means fully uniform. Higher = flatter.
+- **Effective number of tokens:** `N_eff = 1 / Σ pᵢ²` where `p = softmax(logits)`
+  at the last position. `1` means one token takes all the mass, `|V|` means
+  fully uniform. Higher = flatter.
 - **Lock:** fraction of 40 generated tokens equal to `U` (greedy, or sampled at
   T = 0.7 / 1.0).
-- **p(U):** probability of `U` at the first generated step (the hand-off from
-  stage 1 to stage 2).
-- **ΔNLL / top-2 margin:** how much the suffix hurts prediction of the
-  reference continuation (teacher forcing).
+- **p(U):** probability of `U` at the first generated step.
 
 ### Algorithm 1 — flattening (`flatten_robust.py`)
 
-Objective, maximized over discrete token sequences `S`:
+Maximize `F(S) = mean over 8 TRAIN prompts of N_eff(p(· | Cⱼ ⊕ S))` with a
+**gradient-guided search**: one backward pass per prompt gives `∂N_eff/∂e_r` at
+every position; each vocabulary token is scored by its predicted first-order
+gain `g · (E_v − E_{s_r})` (worst case over prompts); the top 32 per position
+are checked with exact forward passes; a swap is kept only if `F` rises.
 
-```
-F(S) = mean over TRAIN contexts Cⱼ of  N_eff( p(· | Cⱼ ⊕ S) )
-```
+Result: a 24-token sequence reaches mean N_eff **29 115** on TRAIN and
+**29 181** on 8 held-out TEST prompts (baseline ≈ 2–4). Longer sequences
+generalize better: at 6 tokens the search overfits (train 1 944, test 592).
 
-averaged over the reference-continuation positions.
+### Algorithm 2 — two-stage convergence
 
-Search procedure:
+`flatten_then_converge.py` compares `C ⊕ U^R` with `C ⊕ S_flat ⊕ U^R`;
+`convergence_tokens.py` ranks candidate tokens `U`.
 
-1. Draw a random pool of 36 non-special vocabulary tokens.
-2. **Greedy beam growth** (beam 3) to length `K = 6`: at each step extend every
-   beam by every pool token and keep the best 3 by `F`.
-3. **Coordinate-ascent refinement** (up to 2 sweeps): revisit each position,
-   try every pool token, keep a change only if `F` rises.
-4. Report against controls (a random suffix and a previous single-prompt
-   suffix `奠ឌ奠`) on **8 TRAIN** and **8 held-out TEST** prompts
-   (short factual stems, see [`prompts_esempio.md`](degradation_defence/prompts_esempio.md) §A).
-
-Result: the 6-token suffix **` ivory原著 Hond第四届ס뀔`** reaches `F = 402.7` on
-TRAIN (baseline `N_eff ≈ 1.6`) and raises `N_eff` on every unseen TEST prompt
-(median +333, minimum +61), versus +13 for a random suffix. Notable findings:
-
-- Flattening is about **direction** in embedding space, not norm; the limit is
-  the discreteness of the vocabulary.
-- No saturation observed: longer suffixes keep increasing `F` (k = 8 → ~629).
-- Flattening ≠ maximal damage: ΔNLL is lower than for a random suffix.
-  Prediction damage tracks the **top-2 margin**, which is almost uncorrelated
-  with `N_eff` (Spearman ≈ 0.05).
-- Flattening tokens are rare, mixed-script tokens (Chinese, Hebrew, Korean,
-  emoji).
-
-### Algorithm 2 — two-stage convergence (`flatten_then_converge.py`)
-
-For each target token `U` and repetition count `R ∈ {8, 32}`, compare:
-
-- **converge only:** `C ⊕ U^R`
-- **flatten + converge:** `C ⊕ S_flat ⊕ U^R`
-
-and measure `p(U)`, greedy lock, and sampled lock (6 samples at T = 0.7 and
-T = 1.0).
-
-Key results (mean over test contexts):
-
-- In greedy decoding the loop almost always holds (lock ≈ 1). The difference
-  shows **under sampling**: for `U = " the"`, `R = 32`, pre-flattening raises
-  the lock from 0.52 → **1.00** (T = 0.7) and 0.34 → **0.85** (T = 1.0).
-  `R = 8` flattened ≈ `R = 32` not flattened.
-- The effect **depends on `U`**: high-frequency, contentless function words
-  (` of`, `\n`, ` and`, ` the`, ` when`) are strong attractors; a lexical token
-  like ` end` is weak and flattening does not help it.
-- On longer prompts (~90-token math problem, ~160-token agent prompt) the loop
-  already dominates on its own, so flattening adds little. It matters most
-  when the context is short and competes with the loop.
-- **Mechanism:** the flattener draws ~45% of the last query's attention onto
-  itself (layer 14, head 0), neutralizing the context; the repeated token then
-  wins with less competition.
+- Greedy decoding loops in both cases (lock ≈ 1).
+- **Under sampling, flattening first makes the loop hold:** at T = 0.7 the lock
+  goes from 0.34–0.59 to 0.94–1.00 for both ` the` and ` end`; at T = 1.0 it
+  improves in every case.
+- The best loop tokens are contentless function words (` of`, `\n`, ` and`,
+  ` the`, ` when`), per a ranking measured with the earlier 6-token flattener.
+- On longer prompts the repeated token already dominates on its own, so
+  flattening adds less.
 
 ### Usage
 
 ```bash
 pip install torch transformers
 cd degradation_defence
-mkdir -p runs                       # flatten_robust.py writes runs/flatten_robust.json
-python3 flatten_robust.py           # search for S_flat (slow on CPU)
-python3 flatten_then_converge.py    # stage-2 comparison, S_flat hard-coded
+mkdir -p runs
+python3 flatten_robust.py          # stage 1 → runs/flatten_robust.json
+python3 convergence_tokens.py      # stage 2 token ranking → runs/convergence_tokens.json
+python3 flatten_then_converge.py   # stage 2 comparison table
 ```
 
-The first run downloads the model (~3.5 GB in float32) from Hugging Face. Both
-scripts use 8 CPU threads and fixed seeds. To test a new flattener, paste its
-token ids into `S_FLAT` in `flatten_then_converge.py`; to try other targets or
-contexts, edit `TARGETS`, `Rs`, and `CTX`.
-
-### Files
-
-| File | Content |
-|---|---|
-| `flatten_robust.py` | Algorithm 1 (beam search + refinement, train/test report). |
-| `flatten_then_converge.py` | Algorithm 2 (converge-only vs flatten+converge). |
-| `prompts_esempio.md` | Every prompt used in the study and what it was used for. |
-| `seeds/` | Short math word-problem contexts used in earlier experiments (seed 01 is also the ~90-token long-context test). |
+The first run downloads the model (about 3.5 GB). All scripts use 8 CPU threads
+and fixed seeds.
 
 ### Dual use
 
@@ -293,11 +251,9 @@ emails an LLM may later read):
 
 ### Limits
 
-One model, a few prompts, greedy/beam search on CPU. The results are measured
-correlations, not general laws. Note that `flatten_then_converge.py` as
-committed runs only the ` the` / ` end` targets on 3 contexts; the longer
-token list and long-context tables in the folder README came from variants of
-the same script.
+One model, a few prompts, CPU-only search. The results are measured
+correlations, not general laws. Some stage-2 tables were measured with an
+earlier 6-token flattener; the folder README marks which ones.
 
 ---
 
@@ -309,12 +265,15 @@ ConnorTools/
 ├── fog/
 │   ├── generator.py           encoder + reader (Python)
 │   ├── decoder.html/.js       browser decoder
-│   ├── README.md / .html      full write-up
-│   └── img/                   decoder screenshots
+│   ├── img/                   decoder screenshots
+│   ├── README.md              full write-up
+│   └── README.pdf             printable write-up with rendered formulas
 └── degradation_defence/
-    ├── flatten_robust.py
-    ├── flatten_then_converge.py
-    ├── prompts_esempio.md
-    ├── seeds/
-    └── README.md              full write-up and result tables
+    ├── flatten_robust.py         stage 1: gradient search for S_flat
+    ├── convergence_tokens.py     stage 2: rank loop tokens
+    ├── flatten_then_converge.py  stage 2: with / without flattening
+    ├── seeds/                    longer math prompts
+    ├── runs/                     saved results (JSON)
+    ├── README.md                 full write-up and result tables
+    └── README.pdf                printable write-up
 ```

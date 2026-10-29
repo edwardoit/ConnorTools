@@ -28,9 +28,12 @@ def encode(text):
     return tok.encode(text, add_special_tokens=False)
 
 
-# Stage-1 flattener (output of flatten_robust.py, refined; mean N_eff over train F=402.7).
+# Stage-1 flattener (output of the gradient search in flatten_robust.py, SEQ_LEN=24,
+# mean N_eff over train F=29115, N_eff on held-out test ~29181).
 # Re-run flatten_robust.py to regenerate it, or override the token ids below.
-S_FLAT = [69816, 116755, 58115, 113447, 123796, 144928]   # ' ivory原著 Hond第四届ס뀔'
+S_FLAT = [47308, 36823, 69184, 11356, 30911, 43431, 7050, 114506, 23364, 53892,
+          108072, 49913, 34187, 102186, 113447, 119504, 115194, 26538, 107921,
+          105618, 83212, 61609, 13814, 6670]   # gradient k=24 flattener
 
 CTX = [
     "The largest planet in our solar system is",
