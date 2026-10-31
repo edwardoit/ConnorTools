@@ -262,6 +262,7 @@ earlier 6-token flattener; the folder README marks which ones.
 ```
 ConnorTools/
 ├── README.md                  ← this overview
+├── LICENSE                    MIT
 ├── fog/
 │   ├── generator.py           encoder + reader (Python)
 │   ├── decoder.html/.js       browser decoder
@@ -277,3 +278,7 @@ ConnorTools/
     ├── README.md                 full write-up and result tables
     └── README.pdf                printable write-up
 ```
+
+## License
+
+Released under the [MIT License](LICENSE).
